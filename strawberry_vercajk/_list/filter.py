@@ -3,6 +3,7 @@ __all__ = [
     "FilterQ",
     "FilterSet",
     "model_filter",
+    "ConditionFilter"
 ]
 
 import abc
@@ -12,6 +13,7 @@ import types
 import typing
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 
 import pydantic
 import pydantic.fields
@@ -365,7 +367,7 @@ class Filter(FilterInterface):
             # e.g., when the field is annotated as list | None
         return typing.get_origin(non_null_type) is list  # True when the field is annotated as list[str] | None
 
-    @functools.cached_property
+    @property
     def lookup(self) -> _DBLookupType:
         """
         Get the lookup to use for the filter. If not specified, it will be inferred from the field type of name.
@@ -460,6 +462,108 @@ class Filter(FilterInterface):
             )
 
 
+@typing.runtime_checkable
+class _LookupFilterInputProtocol(typing.Protocol):
+    lookup: Enum
+    value: typing.Any
+
+
+class LookupFilterMixin:
+    _REQUIRED_ANNOTATIONS: typing.ClassVar[set[str]] = {"lookup", "value"}
+
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        ann = getattr(cls, "__annotations__", {})
+        missing = _LookupFilterInputProtocol.__annotations__.keys() - ann.keys()
+        if missing:
+            raise TypeError(
+                f"{cls.__name__!r} is missing type annotations for: {missing}"
+            )
+
+
+class LookupFilter(Filter):
+    """
+    Filter for an input field that can have different lookups.
+    The lookup inputs must inherit from `LookupFilterMixin`.
+
+    For example:
+        @strawberry.enum
+        class StrFilterLookups(Enum):
+            ICONTAINS = "icontains"
+            EXACT = "exact"
+            STARTSWITH = "startswith"
+            ENDSWITH = "endswith"
+
+        @strawberry.input
+        class StringFilterInput(LookupFilterMixin):
+            lookup: StrFilterLookups
+            value: str
+
+
+        @model_filter(models.User)
+            class UserFilterset(Filterset):
+                first_name: typing.Annotated[
+                    StringFilterInput,
+                    LookupFilter(model_field="first_name")
+                ]
+                ... other filters
+    """
+
+    def get_filter_q(
+            self,
+            value: _LookupFilterInputProtocol,
+    ) -> FilterQ:
+        if not isinstance(value, _LookupFilterInputProtocol):
+            raise TypeError(f"`{type(self).__name__}.get_filter_q()` must be called with an instance of `{LookupFilterMixin.__name__}`. ")
+        if not isinstance(value.lookup, Enum):
+            raise TypeError(f"attribute 'lookup' of `{type(value).__name__}` must be an instance of `Enum`.")
+        self._lookup = value.lookup.value
+        return FilterQ(
+            field=self.model_field,
+            lookup=self.lookup,
+            value=value.value,
+        )
+
+
+class ConditionFilter(FilterInterface):
+    """
+    Filter for an input field that is another Filterset.
+    It is used to allow more verbosity for user defined filters on FE.
+    It should be used as an annotation on the field.
+    For example:
+        @model_filter(models.User)
+        class UserFilterset(Filterset):
+            q: typing.Annotated[
+                str | None,
+                Filter(model_field="first_name", lookup="icontains")
+            ]
+            OR: typing.Annotated[
+                typing.Self | None,
+                ConditionFilter(operator="OR")
+            ]
+            ... other filters
+    """
+
+    def __init__(
+            self,
+            operator: typing.Literal["AND", "OR", "NOT"],
+    ) -> None:
+        self.operator = operator
+
+    def get_filters(self) -> list[typing.Self]:
+        return [self]
+
+    def get_filter_q(self, filterset: "FilterSet") -> FilterQ:
+        return filterset.get_filter_q()
+
+    def _check_lookup_is_resolvable(self) -> None:
+        return None
+
+    @property
+    def check_field_exists(self) -> bool:
+        return False
+
+
 class FilterSet(InputValidator):
     """
     Filterset for filtering a list of objects.
@@ -488,14 +592,32 @@ class FilterSet(InputValidator):
         filters = self.get_filters()
         fq = FilterQ()
         for field_name, field_filter in filters.items():
-            field_filter: FilterInterface
-            input_value = getattr(self, field_name)
-            # Ideally, we'd like to check for strawberry.UNSET instead of None.
-            # But it doesn't work for some reason and None is always passed.
-            # We may need to handle this some way in the future...
-            if input_value is None:
-                continue
-            fq &= field_filter.get_filter_q(input_value)
+            if isinstance(field_filter, ConditionFilter):
+                filterset = getattr(self, field_name, None)
+                if filterset is None:
+                    continue
+                if not isinstance(filterset, FilterSet):
+                    raise TypeError(
+                        f"Expected `{field_name}` to be an instance of `{FilterSet.__name__}`, "
+                        f"but got `{type(filterset).__name__}`.",
+                    )
+                filterset: FilterSet
+                filterset_q = filterset.get_filter_q()
+                if field_filter.operator == "AND":
+                    fq &= filterset_q
+                if field_filter.operator == "OR":
+                    fq |= filterset_q
+                if field_filter.operator == "NOT":
+                    fq &= ~filterset_q
+            else:
+                field_filter: FilterInterface
+                input_value = getattr(self, field_name)
+                # Ideally, we'd like to check for strawberry.UNSET instead of None.
+                # But it doesn't work for some reason and None is always passed.
+                # We may need to handle this some way in the future...
+                if input_value is None:
+                    continue
+                fq &= field_filter.get_filter_q(input_value)
         return fq
 
     @classmethod
