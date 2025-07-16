@@ -3,7 +3,9 @@ __all__ = [
     "FilterQ",
     "FilterSet",
     "model_filter",
-    "ConditionFilter"
+    "ConditionFilter",
+    "LookupFilter",
+    "LookupFilterMixin"
 ]
 
 import abc
