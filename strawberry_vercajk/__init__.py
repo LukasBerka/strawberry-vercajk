@@ -15,7 +15,7 @@ from strawberry_vercajk._id_hasher import (
     HashedID,
 )
 
-from strawberry_vercajk._list.filter import FilterSet, Filter, FilterQ, model_filter
+from strawberry_vercajk._list.filter import FilterSet, Filter, FilterQ, model_filter, ConditionFilter, LookupFilter, LookupFilterMixin
 from strawberry_vercajk._list.graphql import (
     PageInnerMetadataType,
     PageMetadataType,
